@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Geothermal Cooling Demo — AI Performance Benchmark
-----------------------------------------------------
+
 Runs a small LLM (via llama.cpp) in a continuous loop while logging:
   - CPU temperature
   - CPU clock speed
@@ -15,7 +15,7 @@ Usage:
 
 Requirements:
   pip install llama-cpp-python
-  A GGUF model file (e.g. TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf)
+  GGUF model file (e.g. TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf)
   Download from: https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF
 """
 
@@ -26,7 +26,7 @@ import argparse
 import os
 from datetime import datetime
 
-# ── Try to import llama-cpp-python ─────────────────────────────────────────
+# Try to import llama-cpp-python
 try:
     from llama_cpp import Llama
     LLAMA_AVAILABLE = True
@@ -36,7 +36,7 @@ except ImportError:
     print("Install with: pip install llama-cpp-python")
 
 
-# ── System metric helpers ───────────────────────────────────────────────────
+# System metric helpers
 
 def get_cpu_temp():
     """Read CPU temperature from vcgencmd. Returns float in Celsius."""
@@ -98,7 +98,7 @@ def get_throttle_status():
         }
 
 
-# ── Prompt used for repeated LLM inference ─────────────────────────────────
+# Prompt used for repeated LLM inference
 
 STRESS_PROMPT = (
     "Explain in detail how geothermal heat exchange systems work, "
@@ -108,7 +108,7 @@ STRESS_PROMPT = (
 )
 
 
-# ── CSV logging ─────────────────────────────────────────────────────────────
+# CSV logging
 
 def get_csv_path(condition):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -162,7 +162,7 @@ def print_status(elapsed, duration, condition, temp, clock, throttle, tps):
     )
 
 
-# ── Main benchmark loop ─────────────────────────────────────────────────────
+# Main benchmark loop
 
 def run_benchmark(model_path, condition, duration_min, output_dir):
     duration_sec = duration_min * 60
@@ -261,7 +261,7 @@ def run_benchmark(model_path, condition, duration_min, output_dir):
     return csv_path
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────
+# Entry point
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

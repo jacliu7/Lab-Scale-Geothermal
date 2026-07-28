@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""
+thermal_system_id.py
+
+Thermal system identification for the Pi geothermal-cooling rig.
+
+What this does
+---------------
+1. Loads a benchmark log (CSV) with a timestamp/elapsed-time column, a
+   temperature column (CPU temp, or T_in/T_out), and a load/phase marker
+   that tells us when a step change happened (e.g. idle -> full load,
+   full load -> idle, pump on -> pump off).
+2. Auto-detects step events from the load/phase column (or accepts
+   explicit step timestamps from the command line).
+3. Fits die temperature as delta_T = T_die - T_ambient rather than the
+   absolute temperature whenever an ambient column is available, so
+   ambient drift across trials doesn't bleed into the R_th estimate.
+   Falls back to absolute temperature if no ambient column is given.
+4. For each step, fits TWO candidate models:
+
+   (a) Single first-order response, fit two ways so results are directly
+       comparable to the published literature:
+         - Nonlinear least squares (scipy.optimize.curve_fit) on the raw
+           delta_T data. The more statistically correct fit.
+         - Linearized log-fit on theta = (dT - dT_min) / (dT_max - dT_min):
+             ln(1 - theta) = -t / tau
+           This is the exact method used in the standard data-center
+           thermal transient reference (Shields, "Dynamic Thermal
+           Response of the Data Center to Cooling Loss During Facility
+           Power Failure," Georgia Tech M.S. Thesis, 2009), so tau from
+           this method can go directly into a table next to theirs.
+
+   (b) Two-exponential response:
+             dT(t) = dT_ss + A1*exp(-t/tau1) + A2*exp(-t/tau2)
+       A single lumped RC node (no_cooling, fan) usually doesn't need
+       this. The geothermal loop is a chain of thermal masses (die ->
+       heatsink -> coolant -> loop -> reservoir) and can show a fast
+       initial transient plus a slower tail that a single exponential
+       under-fits. This script fits both and picks whichever is
+       actually justified by the data (see model selection below) so a
+       two-exponential model doesn't get force-fit onto a condition
+       that's cleanly single-node, and a single exponential doesn't get
+       force-fit onto a condition that isn't.
+
+5. Model selection: compares single vs. double exponential by AIC
+   (lower is better, penalized for the extra 2 parameters in the double
+   fit) and by a residual randomness check (runs test on the sign of the
+   single-exponential residuals -- a run count far below what's expected
+   under randomness means the residuals have curvature the single
+   exponential missed, i.e. it's the wrong model shape, not just noise).
+   The double-exponential model is only reported as the winner when both
+   the AIC improvement is decisive (delta AIC > 10) AND the residual
+   check flags non-random structure in the single-exponential fit;
+   otherwise the simpler single-exponential model is kept.
+
+6. Computes effective thermal resistance R = dT_ss / Q and thermal
+   capacitance C = tau / R for each step (single-exponential tau; for a
+   two-exponential winner, C is reported per time constant against the
+   corresponding partial resistance implied by each amplitude).
+
+7. Produces:
+     - a CSV summary table (one row per step, per cooling condition)
+     - a figure overlaying raw data + both fits for each step
+     - a benchmark comparison figure: your tau values vs. published
+       server / CRAC time constants
+     - a markdown table you can drop straight into the manuscript
+
+Expected input CSV columns (rename via --col-* flags if yours differ):
+    time_s        : elapsed seconds since test start (float)
+    cpu_temp_c     : CPU temperature, deg C
+    ambient_c      : room/ambient temperature, deg C (optional but
+                      recommended -- enables delta_T fitting)
+    t_in_c         : coolant inlet temp, deg C   (optional)
+    t_out_c        : coolant outlet temp, deg C  (optional)
+    power_w        : total measured power draw, W (Pi + pump, or Pi only)
+    cooling_type   : string label, e.g. "none", "fan", "loop"
+    load_state     : string or int marker for phase, e.g. "idle"/"load",
+                      or 0/1. Used to auto-detect step transitions.
+
+You do not need every column filled for every row; the script only
+requires time_s, one temperature column, and load_state (or explicit
+--steps timestamps) to run the tau fit. power_w is needed for R and C.
+
+Usage
+-----
+    python3 thermal_system_id.py --input rig_log.csv --outdir results \
+        --temp-col cpu_temp_c --ambient-col ambient_c --cooling-col cooling_type
+
+    # or, if you already know exactly when your steps happened:
+    python3 thermal_system_id.py --input rig_log.csv --outdir results \
+        --temp-col cpu_temp_c --ambient-col ambient_c --steps 0,1200,2400,3600
+
+This module is also imported directly by step_load_test.py, which calls
+analyze_step() on each step/hold transition as soon as it's captured,
+rather than round-tripping through a saved CSV.
+"""
+
+import argparse
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+
+# ---------------------------------------------------------------------------
+# Published reference values for comparison.
+# Source: Shields, S. "Dynamic Thermal Response of the Data Center to
+# Cooling Loss During Facility Power Failure." M.S. Thesis, Georgia
+# Institute of Technology, School of Mechanical Engineering, Aug 2009.
+# Chapter 3 (Server Time Constant Experiment) and Chapter 5 (CRAC HX
+# Response). Time constants extracted via step-change-in-inlet-temperature
+# experiments and least-squares fit to a first-order model, same approach
+# used in this script.
+# ---------------------------------------------------------------------------
+LITERATURE_TAU_S = {
+    "Legacy server, full load (processor outlet)": 340,
+    "Legacy server, full load (PSU outlet)": 380,
+    "Legacy server, idle (processor outlet)": 370,
+    "Legacy server, idle (PSU outlet)": 300,
+    "Modern 2U Xeon server, full load (processor outlet)": 130,
+    "Modern 2U Xeon server, full load (PSU outlet)": 990,
+    "Bare resistive heater (thermal-mass lower limit)": 50,
+    "CRAC air-to-water HX (coolant flow step)": 10,
+}
+
+# Published PUE benchmarks for the manuscript's separate PUE comparison
+# figure (not used in the tau fit itself, kept here for convenience so
+# both figures pull from one script). Source: Uptime Institute 2025
+# Global Data Center Survey; Google 2025 fleet-wide sustainability data.
+LITERATURE_PUE = {
+    "Global industry average (Uptime Institute 2025)": 1.54,
+    "Enterprise / colocation average": 1.69,   # midpoint of 1.58-1.80 range
+    "Hyperscale average (Google/Meta/MSFT/AWS)": 1.12,  # midpoint 1.10-1.15
+    "Google fleet-wide 2025": 1.09,
+    "New-build regulatory target (2026+, e.g. Germany EnEfG)": 1.20,
+}
+
+
+# ---------------------------------------------------------------------------
+# Model functions
+# ---------------------------------------------------------------------------
+
+def first_order_model(t, T_ss, T0, tau):
+    """T(t) = T_ss + (T0 - T_ss) * exp(-t/tau)"""
+    return T_ss + (T0 - T_ss) * np.exp(-t / tau)
+
+
+def two_exp_model(t, T_ss, A1, tau1, A2, tau2):
+    """T(t) = T_ss + A1*exp(-t/tau1) + A2*exp(-t/tau2)
+
+    A1, A2 carry the sign of the transient (positive for a decay toward
+    T_ss from above, negative for a rise toward T_ss from below), so this
+    covers both step-up and step-down without needing a separate model.
+    """
+    return T_ss + A1 * np.exp(-t / tau1) + A2 * np.exp(-t / tau2)
+
+
+def fit_nonlinear(t, T):
+    """Nonlinear least-squares fit of the first-order step response."""
+    T0_guess = T[0]
+    Tss_guess = T[-1]
+    tau_guess = max((t[-1] - t[0]) / 4, 1.0)
+    p0 = [Tss_guess, T0_guess, tau_guess]
+    try:
+        popt, pcov = curve_fit(first_order_model, t, T, p0=p0, maxfev=20000)
+        T_ss, T0, tau = popt
+        resid = T - first_order_model(t, *popt)
+        ss_res = np.sum(resid ** 2)
+        ss_tot = np.sum((T - np.mean(T)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+        return {"T_ss": T_ss, "T0": T0, "tau_s": abs(tau), "r2": r2,
+                "resid": resid, "n_params": 3, "sse": ss_res}
+    except RuntimeError:
+        return {"T_ss": np.nan, "T0": np.nan, "tau_s": np.nan, "r2": np.nan,
+                "resid": None, "n_params": 3, "sse": np.nan}
+
+
+def fit_two_exponential(t, T):
+    """
+    Nonlinear least-squares fit of the two-exponential response. Seeds
+    tau1 short (fast die/heatsink transient) and tau2 long (slow
+    coolant/reservoir tail), and constrains tau1 < tau2 via bounds so the
+    optimizer can't just swap labels and land on a degenerate duplicate
+    of the single-exponential fit.
+    """
+    T0_guess = T[0]
+    Tss_guess = T[-1]
+    span = T0_guess - Tss_guess
+    total_span = max(t[-1] - t[0], 2.0)
+    tau1_guess = max(total_span / 20.0, 1.0)
+    tau2_guess = max(total_span / 3.0, tau1_guess * 3)
+    p0 = [Tss_guess, span * 0.5, tau1_guess, span * 0.5, tau2_guess]
+    lower = [-np.inf, -np.inf, 0.5, -np.inf, tau1_guess]
+    upper = [np.inf, np.inf, tau2_guess, np.inf, total_span * 10]
+    try:
+        popt, pcov = curve_fit(
+            two_exp_model, t, T, p0=p0, bounds=(lower, upper), maxfev=40000
+        )
+        T_ss, A1, tau1, A2, tau2 = popt
+        resid = T - two_exp_model(t, *popt)
+        ss_res = np.sum(resid ** 2)
+        ss_tot = np.sum((T - np.mean(T)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+        return {"T_ss": T_ss, "A1": A1, "tau1_s": abs(tau1),
+                "A2": A2, "tau2_s": abs(tau2), "r2": r2,
+                "resid": resid, "n_params": 5, "sse": ss_res}
+    except (RuntimeError, ValueError):
+        return {"T_ss": np.nan, "A1": np.nan, "tau1_s": np.nan,
+                "A2": np.nan, "tau2_s": np.nan, "r2": np.nan,
+                "resid": None, "n_params": 5, "sse": np.nan}
+
+
+def fit_linearized(t, T, T_min=None, T_max=None):
+    """
+    Linearized log-fit, matching the literature methodology:
+        theta = (T - T_min) / (T_max - T_min)
+        ln(1 - theta) = -t / tau
+    Fit a line through the origin-referenced log data via least squares.
+    T_min/T_max default to the first/last sample if not given (use the
+    literature's convention of fixing these from known asymptotes if you
+    have cleaner steady-state values available).
+    """
+    t = np.asarray(t, dtype=float)
+    T = np.asarray(T, dtype=float)
+    if T_min is None:
+        T_min = min(T[0], T[-1])
+    if T_max is None:
+        T_max = max(T[0], T[-1])
+    span = T_max - T_min
+    if span == 0:
+        return {"tau_s": np.nan, "r2": np.nan}
+
+    theta = (T - T_min) / span
+    # guard against theta >= 1 or <= 0 from noise at the tail
+    theta = np.clip(theta, 1e-6, 1 - 1e-6)
+    y = np.log(1 - theta)
+    t0 = t - t[0]
+
+    # least squares slope through the data (not forced through origin,
+    # to absorb any small timing offset, matching thesis appendix method)
+    A = np.vstack([t0, np.ones_like(t0)]).T
+    slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+    tau = -1.0 / slope if slope != 0 else np.nan
+
+    y_pred = A @ np.array([slope, intercept])
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return {"tau_s": abs(tau), "r2": r2}
+
+
+# ---------------------------------------------------------------------------
+# Residual diagnostics / model selection
+# ---------------------------------------------------------------------------
+
+def runs_test_on_residual_sign(resid):
+    """
+    Wald-Wolfowitz runs test on the sign of the residuals. A 'run' is a
+    maximal stretch of consecutive same-sign residuals. If the single
+    exponential is the right shape, residual sign should flip roughly
+    randomly (many short runs). If it's missing curvature (e.g. a fast
+    transient plus a slow tail that it's averaging over), residuals will
+    be positive for a stretch, then negative for a stretch, then positive
+    again: a small number of long runs.
+
+    Returns a dict with the observed run count, the expected count and
+    std dev under randomness, and a z-score. z << 0 (well below -1.96 at
+    the usual 5% threshold) means "fewer runs than random chance would
+    give you", i.e. the residuals have structure the model didn't
+    capture.
+    """
+    if resid is None or len(resid) < 8:
+        return {"n_runs": None, "z": None, "flag_nonrandom": False}
+
+    signs = np.sign(resid)
+    signs = signs[signs != 0]
+    if len(signs) < 8:
+        return {"n_runs": None, "z": None, "flag_nonrandom": False}
+
+    n_pos = np.sum(signs > 0)
+    n_neg = np.sum(signs < 0)
+    n = n_pos + n_neg
+    n_runs = 1 + np.sum(signs[1:] != signs[:-1])
+
+    if n_pos == 0 or n_neg == 0:
+        return {"n_runs": int(n_runs), "z": None, "flag_nonrandom": True}
+
+    mean_runs = (2 * n_pos * n_neg) / n + 1
+    var_runs = (2 * n_pos * n_neg * (2 * n_pos * n_neg - n)) / (n ** 2 * (n - 1))
+    if var_runs <= 0:
+        return {"n_runs": int(n_runs), "z": None, "flag_nonrandom": False}
+
+    z = (n_runs - mean_runs) / np.sqrt(var_runs)
+    flag = z < -1.96  # significantly fewer runs than expected -> non-random structure
+    return {"n_runs": int(n_runs), "z": round(float(z), 2), "flag_nonrandom": bool(flag)}
+
+
+def compute_aic(sse, n, k):
+    """
+    AICc (small-sample-corrected AIC) for a least-squares fit with
+    Gaussian errors: AIC + 2k(k+1)/(n-k-1). Plain AIC's 2k penalty
+    under-penalizes extra parameters when n isn't much bigger than k,
+    which is exactly the regime a short post-step fit window can land
+    in (the two-exponential model has 5 parameters; a few dozen samples
+    isn't enough for the plain-AIC penalty to reliably outweigh the
+    extra flexibility). AICc converges to AIC as n grows, so this is a
+    strict improvement, not a different criterion for large windows.
+    """
+    if sse is None or np.isnan(sse) or sse <= 0 or n <= k + 1:
+        return np.nan
+    aic = n * np.log(sse / n) + 2 * k
+    correction = (2 * k * (k + 1)) / (n - k - 1)
+    return aic + correction
+
+
+def select_model(t, T, single_fit, double_fit):
+    """
+    Decide whether the single- or two-exponential fit should be reported
+    for this step. Defaults to the single exponential (fewer parameters,
+    easier to compare against the literature) unless the double
+    exponential is decisively better AND the single exponential's
+    residuals show the non-random structure that indicates a missed
+    fast/slow split. Requiring both conditions keeps a noisy dataset
+    from spuriously "winning" the extra parameters.
+    """
+    n = len(t)
+    aic_single = compute_aic(single_fit.get("sse"), n, single_fit.get("n_params", 3))
+    aic_double = compute_aic(double_fit.get("sse"), n, double_fit.get("n_params", 5))
+    delta_aic = (aic_single - aic_double) if not (np.isnan(aic_single) or np.isnan(aic_double)) else np.nan
+
+    runs = runs_test_on_residual_sign(single_fit.get("resid"))
+
+    decisive_aic = (not np.isnan(delta_aic)) and delta_aic > 10
+    use_double = decisive_aic and runs["flag_nonrandom"] and not np.isnan(double_fit.get("tau1_s", np.nan))
+
+    return {
+        "chosen_model": "two_exponential" if use_double else "single_exponential",
+        "aic_single": round(float(aic_single), 2) if not np.isnan(aic_single) else np.nan,
+        "aic_double": round(float(aic_double), 2) if not np.isnan(aic_double) else np.nan,
+        "delta_aic": round(float(delta_aic), 2) if not np.isnan(delta_aic) else np.nan,
+        "residual_runs": runs["n_runs"],
+        "residual_runs_z": runs["z"],
+        "residual_flagged_nonrandom": runs["flag_nonrandom"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step detection / slicing
+# ---------------------------------------------------------------------------
+
+def detect_steps(df, load_col, time_col):
+    """Return indices where load_state changes value (a step event)."""
+    states = df[load_col].astype(str).values
+    change_idx = [0]
+    for i in range(1, len(states)):
+        if states[i] != states[i - 1]:
+            change_idx.append(i)
+    return change_idx
+
+
+def slice_window(df, time_col, start_time, window_s, next_boundary=None):
+    """
+    Slice [start_time, start_time + window_s], additionally capped to
+    strictly before next_boundary when given. next_boundary is the start
+    time of the following step/phase (e.g. step-down's start time when
+    slicing step-up) -- without this cap, a --fit-window / --window
+    longer than the actual hold duration silently pulls in samples from
+    the next phase (e.g. the start of the cooldown bleeding into a
+    heating-transient fit), which biases both the temperature curve
+    being fit and the Q_ss power average used for R_th.
+    """
+    mask = (df[time_col] >= start_time) & (df[time_col] <= start_time + window_s)
+    if next_boundary is not None:
+        mask &= df[time_col] < next_boundary
+    return df[mask]
+
+
+def analyze_step(df, time_col, temp_col, power_col, start_time, window_s, label,
+                  ambient_col=None, next_boundary=None):
+    """
+    Fit one step transition. If ambient_col is given and present, fits
+    delta_T = temp_col - ambient_col instead of the raw temperature, so
+    ambient drift between trials doesn't leak into R_th. Falls back to
+    absolute temperature otherwise (with a note in the result so it's
+    clear in the summary table which basis was used).
+
+    next_boundary, if given, is the start time of the following step --
+    the fit window is clipped there so it can never bleed into the next
+    phase (see slice_window).
+    """
+    sub = slice_window(df, time_col, start_time, window_s, next_boundary=next_boundary)
+    if len(sub) < 8:
+        return None
+
+    requested_end = start_time + window_s
+    window_clipped = next_boundary is not None and next_boundary < requested_end
+
+    t = sub[time_col].values.astype(float)
+    t = t - t[0]
+
+    used_delta = ambient_col is not None and ambient_col in sub.columns
+    if used_delta:
+        T = (sub[temp_col].values.astype(float) - sub[ambient_col].values.astype(float))
+        fit_basis = "delta_T_vs_ambient"
+    else:
+        T = sub[temp_col].values.astype(float)
+        fit_basis = "absolute_temp"
+
+    nl = fit_nonlinear(t, T)
+    two_exp = fit_two_exponential(t, T)
+    selection = select_model(t, T, nl, two_exp)
+
+    # Reference values for the linearized cross-check: use the nonlinear
+    # fit's converged asymptotes (T_ss, T0) rather than the raw window
+    # endpoints. Within a finite window the raw endpoints haven't fully
+    # converged, which biases the log-linearization heavily since it
+    # divides by (T_max - T_min). This mirrors the literature approach of
+    # using independently-known steady-state values rather than the last
+    # sample in a possibly-truncated window.
+    if not np.isnan(nl.get("T_ss", np.nan)):
+        t_lo = min(nl["T0"], nl["T_ss"])
+        t_hi = max(nl["T0"], nl["T_ss"])
+        lin = fit_linearized(t, T, T_min=t_lo, T_max=t_hi)
+    else:
+        lin = fit_linearized(t, T)
+
+    result = {
+        "label": label,
+        "start_time_s": start_time,
+        "window_s": window_s,
+        "window_clipped_to_next_step": window_clipped,
+        "effective_window_s": round(float(t[-1]), 1) if len(t) else window_s,
+        "n_samples": len(sub),
+        "fit_basis": fit_basis,
+        "T_start_c": T[0],
+        "T_end_c": T[-1],
+        "delta_T_c": T[-1] - T[0],
+        "tau_nonlinear_s": nl["tau_s"],
+        "r2_nonlinear": nl["r2"],
+        "tau_linearized_s": lin["tau_s"],
+        "r2_linearized": lin["r2"],
+        "chosen_model": selection["chosen_model"],
+        "delta_aic": selection["delta_aic"],
+        "residual_runs": selection["residual_runs"],
+        "residual_runs_z": selection["residual_runs_z"],
+        "residual_flagged_nonrandom": selection["residual_flagged_nonrandom"],
+        "tau1_two_exp_s": two_exp["tau1_s"],
+        "tau2_two_exp_s": two_exp["tau2_s"],
+        "A1_two_exp_c": two_exp.get("A1", np.nan),
+        "A2_two_exp_c": two_exp.get("A2", np.nan),
+        "r2_two_exp": two_exp["r2"],
+    }
+
+    if window_clipped:
+        print(f"  [{label}] requested window ({window_s:.0f}s) exceeds the gap to the next "
+              f"step -- clipped to {result['effective_window_s']:.0f}s so the fit doesn't "
+              f"bleed into the next phase's data.")
+
+    if result["chosen_model"] == "two_exponential" and result["residual_flagged_nonrandom"]:
+        print(f"  [{label}] single-exponential residuals show non-random structure "
+              f"(runs={selection['residual_runs']}, z={selection['residual_runs_z']}); "
+              f"two-exponential fit selected (delta AIC={selection['delta_aic']}).")
+
+    if power_col is not None and power_col in sub.columns:
+        dQ = sub[power_col].values.astype(float)
+        tail = dQ[-max(3, len(dQ) // 10):]
+        Q_ss = np.nanmean(tail) if np.any(~np.isnan(tail)) else np.nan
+        dT_ss = result["delta_T_c"]
+        if not np.isnan(Q_ss) and Q_ss != 0:
+            R_thermal = abs(dT_ss / Q_ss)          # deg C / W
+            tau_use = nl["tau_s"] if not np.isnan(nl["tau_s"]) else lin["tau_s"]
+            C_thermal = tau_use * (1.0 / R_thermal) if R_thermal != 0 else np.nan
+            result["Q_ss_w"] = Q_ss
+            result["R_thermal_c_per_w"] = R_thermal
+            result["C_thermal_j_per_c"] = C_thermal
+
+            # Per-branch (Foster network) R/C for the two-exponential fit,
+            # used by bursty_test.py to simulate the response to an
+            # arbitrary Q(t) rather than just report tau for this one step.
+            # Each branch's steady-state contribution is |A_i|, so its
+            # resistance is |A_i| / Q_ss, same convention as the single-
+            # node R_thermal above (R1 + R2 should land close to
+            # R_thermal_c_per_w as a sanity check).
+            if not np.isnan(two_exp.get("A1", np.nan)):
+                R1 = abs(two_exp["A1"] / Q_ss)
+                R2 = abs(two_exp["A2"] / Q_ss)
+                result["R1_two_exp_c_per_w"] = R1
+                result["R2_two_exp_c_per_w"] = R2
+                result["C1_two_exp_j_per_c"] = two_exp["tau1_s"] / R1 if R1 != 0 else np.nan
+                result["C2_two_exp_j_per_c"] = two_exp["tau2_s"] / R2 if R2 != 0 else np.nan
+        else:
+            result["Q_ss_w"] = Q_ss if not np.isnan(Q_ss) else ""
+            result["R_thermal_c_per_w"] = np.nan
+            result["C_thermal_j_per_c"] = np.nan
+
+    return result, sub, nl, two_exp
+
+
+def make_step_plot(result, sub, nl, two_exp, time_col, temp_col, outdir, idx,
+                    ambient_col=None):
+    t = sub[time_col].values.astype(float)
+    t0 = t - t[0]
+    if ambient_col is not None and ambient_col in sub.columns:
+        T = sub[temp_col].values.astype(float) - sub[ambient_col].values.astype(float)
+        ylabel = "Delta T vs. ambient [C]"
+    else:
+        T = sub[temp_col].values.astype(float)
+        ylabel = "Temperature [C]"
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(t0, T, "o", ms=3, color="#444444", label="Measured")
+
+    if not np.isnan(nl["tau_s"]):
+        t_fit = np.linspace(0, t0[-1], 200)
+        T_fit = first_order_model(t_fit, nl["T_ss"], nl["T0"], nl["tau_s"])
+        style = "-" if result["chosen_model"] == "single_exponential" else "--"
+        ax.plot(t_fit, T_fit, style, lw=2, color="#d95f02",
+                 label=f"Single exp (tau = {nl['tau_s']:.0f} s, R2 = {nl['r2']:.3f})")
+
+    if not np.isnan(two_exp.get("tau1_s", np.nan)):
+        t_fit = np.linspace(0, t0[-1], 200)
+        T_fit2 = two_exp_model(t_fit, two_exp["T_ss"], two_exp["A1"], two_exp["tau1_s"],
+                                two_exp["A2"], two_exp["tau2_s"])
+        style = "-" if result["chosen_model"] == "two_exponential" else ":"
+        ax.plot(t_fit, T_fit2, style, lw=2, color="#1b9e77",
+                 label=f"Two exp (tau1={two_exp['tau1_s']:.0f}s, tau2={two_exp['tau2_s']:.0f}s, "
+                       f"R2={two_exp['r2']:.3f})")
+
+    ax.set_xlabel("Time since step [s]")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{result['label']}  [chosen: {result['chosen_model']}]")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fname = os.path.join(outdir, f"step_fit_{idx:02d}.png")
+    fig.savefig(fname, dpi=150)
+    plt.close(fig)
+    return fname
+
+
+def make_benchmark_plot(results_df, outdir):
+    """Bar chart: your rig's tau values next to the published server/CRAC values.
+    Uses each step's chosen model: tau_nonlinear_s for single-exponential
+    winners, tau2 (the slow/dominant time constant) for two-exponential
+    winners, since that's the one directly comparable to a lumped-model
+    literature tau."""
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    lit_labels = list(LITERATURE_TAU_S.keys())
+    lit_values = list(LITERATURE_TAU_S.values())
+
+    rig_labels = []
+    rig_values = []
+    if results_df is not None and len(results_df) > 0:
+        for _, row in results_df.iterrows():
+            if row.get("chosen_model") == "two_exponential" and not pd.isna(row.get("tau2_two_exp_s")):
+                tau = row["tau2_two_exp_s"]
+                tag = "RIG (tau2, 2-exp)"
+            else:
+                tau = row.get("tau_nonlinear_s", np.nan)
+                tag = "RIG"
+            if not pd.isna(tau):
+                rig_labels.append(f"{tag}: {row['label']}")
+                rig_values.append(tau)
+
+    all_labels = lit_labels + rig_labels
+    all_values = lit_values + rig_values
+    colors = ["#7570b3"] * len(lit_labels) + ["#1b9e77"] * len(rig_labels)
+
+    y_pos = np.arange(len(all_labels))
+    ax.barh(y_pos, all_values, color=colors)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(all_labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Time constant, tau [s] (log scale)")
+    ax.set_xscale("log")
+    ax.set_title("Thermal time constant: lab rig vs. published data center hardware\n"
+                 "(purple = literature, green = this rig)")
+    ax.grid(alpha=0.3, axis="x", which="both")
+    fig.tight_layout()
+    fname = os.path.join(outdir, "tau_benchmark_comparison.png")
+    fig.savefig(fname, dpi=150)
+    plt.close(fig)
+    return fname
+
+
+def run_thermal_sysid(df, outdir, time_col="time_s", temp_col="cpu_temp_c",
+                       power_col="power_w", load_col="load_state",
+                       cooling_col="cooling_type", ambient_col="ambient_c",
+                       window_s=500.0, explicit_steps=None):
+    """
+    Core entry point, usable both from the CLI (main(), below) and
+    directly from step_load_test.py without going through a CSV file.
+    Returns (results_df, results_csv_path, md_path, bench_plot_path).
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    power_col = power_col if power_col and power_col in df.columns else None
+    ambient_col = (
+        ambient_col if ambient_col and ambient_col in df.columns and df[ambient_col].notna().any()
+        else None
+    )
+
+    if explicit_steps:
+        step_times = list(explicit_steps)
+    else:
+        if load_col not in df.columns:
+            raise ValueError(
+                f"No explicit steps given and load column '{load_col}' not found. "
+                f"Either add a load_state column or pass explicit step times."
+            )
+        idxs = detect_steps(df, load_col, time_col)
+        step_times = [df.iloc[i][time_col] for i in idxs]
+
+    conditions = df[cooling_col].unique() if cooling_col in df.columns else [None]
+
+    all_results = []
+    plot_idx = 0
+
+    for cond in conditions:
+        sub_df = df[df[cooling_col] == cond] if cond is not None else df
+        if explicit_steps:
+            local_step_times = step_times
+        elif load_col in df.columns:
+            idxs = detect_steps(sub_df.reset_index(drop=True), load_col, time_col)
+            local_step_times = [sub_df.reset_index(drop=True).iloc[i][time_col] for i in idxs]
+        else:
+            local_step_times = step_times
+
+        local_step_times = sorted(local_step_times)
+        for i, st in enumerate(local_step_times):
+            next_boundary = local_step_times[i + 1] if i + 1 < len(local_step_times) else None
+            label = f"{cond if cond else 'all'} @ t={st:.0f}s"
+            out = analyze_step(sub_df, time_col, temp_col, power_col, st, window_s, label,
+                                ambient_col=ambient_col, next_boundary=next_boundary)
+            if out is None:
+                continue
+            result, sub, nl, two_exp = out
+            result["cooling_type"] = cond
+            all_results.append(result)
+            plot_idx += 1
+            make_step_plot(result, sub, nl, two_exp, time_col, temp_col, outdir, plot_idx,
+                            ambient_col=ambient_col)
+
+    results_df = pd.DataFrame(all_results)
+    results_csv = os.path.join(outdir, "tau_fit_summary.csv")
+    results_df.to_csv(results_csv, index=False)
+
+    bench_plot = make_benchmark_plot(results_df, outdir)
+
+    md_path = os.path.join(outdir, "tau_summary_table.md")
+    with open(md_path, "w") as f:
+        f.write("# Thermal system-ID summary\n\n")
+        f.write("## This rig\n\n")
+        if len(results_df) > 0:
+            cols = ["label", "cooling_type", "fit_basis", "chosen_model", "delta_T_c",
+                    "window_clipped_to_next_step", "effective_window_s",
+                    "tau_nonlinear_s", "r2_nonlinear", "tau_linearized_s", "r2_linearized",
+                    "tau1_two_exp_s", "tau2_two_exp_s", "r2_two_exp",
+                    "R_thermal_c_per_w", "C_thermal_j_per_c",
+                    "R1_two_exp_c_per_w", "C1_two_exp_j_per_c",
+                    "R2_two_exp_c_per_w", "C2_two_exp_j_per_c"]
+            cols = [c for c in cols if c in results_df.columns]
+            f.write(results_df[cols].round(3).to_markdown(index=False))
+        else:
+            f.write("No steps could be fit. Check --steps or --load-col.\n")
+        f.write("\n\n## Published reference values (Shields, 2009, Georgia Tech)\n\n")
+        f.write("| System | tau [s] |\n|---|---|\n")
+        for k, v in LITERATURE_TAU_S.items():
+            f.write(f"| {k} | {v} |\n")
+
+    return results_df, results_csv, md_path, bench_plot
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--input", required=True, help="Path to benchmark log CSV")
+    ap.add_argument("--outdir", default=None,
+                     help="Output directory. Default: a 'thermal_sysid_results' folder created "
+                          "next to --input (not the current working directory), so results land "
+                          "alongside the CSV regardless of where this script itself lives.")
+    ap.add_argument("--time-col", default="time_s")
+    ap.add_argument("--temp-col", default="cpu_temp_c",
+                     help="Temperature column to fit (cpu_temp_c, t_out_c, etc.)")
+    ap.add_argument("--ambient-col", default="ambient_c",
+                     help="Ambient temperature column. If present, fits are done on "
+                          "delta_T = temp_col - ambient_col. Set to '' to force absolute-temp fitting.")
+    ap.add_argument("--power-col", default="power_w",
+                     help="Power column for R/C calculation (set to '' to skip)")
+    ap.add_argument("--load-col", default="load_state",
+                     help="Column marking idle/load phase, used for auto step detection")
+    ap.add_argument("--cooling-col", default="cooling_type",
+                     help="Column labeling cooling condition (none/fan/loop)")
+    ap.add_argument("--window", type=float, default=500.0,
+                     help="Seconds of data to use after each detected step "
+                          "(literature used the first 200-500 s of the response)")
+    ap.add_argument("--steps", default=None,
+                     help="Comma-separated explicit step start times in seconds, "
+                          "overrides auto-detection, e.g. --steps 0,1200,2400")
+    args = ap.parse_args()
+
+    if args.outdir is None:
+        input_dir = os.path.dirname(os.path.abspath(args.input))
+        args.outdir = os.path.join(input_dir, "thermal_sysid_results")
+
+    df = pd.read_csv(args.input)
+    if args.time_col not in df.columns:
+        sys.exit(f"Column '{args.time_col}' not found. Available columns: {list(df.columns)}")
+    if args.temp_col not in df.columns:
+        sys.exit(f"Column '{args.temp_col}' not found. Available columns: {list(df.columns)}")
+
+    explicit_steps = [float(x) for x in args.steps.split(",")] if args.steps else None
+
+    results_df, results_csv, md_path, bench_plot = run_thermal_sysid(
+        df, args.outdir,
+        time_col=args.time_col, temp_col=args.temp_col, power_col=args.power_col,
+        load_col=args.load_col, cooling_col=args.cooling_col, ambient_col=args.ambient_col,
+        window_s=args.window, explicit_steps=explicit_steps,
+    )
+
+    print(f"\nWrote {len(results_df)} step fits.")
+    print(f"  Summary CSV : {results_csv}")
+    print(f"  Markdown    : {md_path}")
+    print(f"  Benchmark plot: {bench_plot}")
+    print(f"  Per-step plots: {args.outdir}/step_fit_*.png")
+
+    if len(results_df) > 0:
+        print("\ntau by step (chosen model):")
+        print(results_df[["label", "chosen_model", "tau_nonlinear_s",
+                           "tau1_two_exp_s", "tau2_two_exp_s"]].to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

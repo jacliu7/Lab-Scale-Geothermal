@@ -21,11 +21,9 @@ Protocol, per the test plan
   instantly start the LLM inference workload at full load and hold until
   the same stabilization criterion is met again, then stop the load and
   idle back down to steady state again.
-- Ambient room temperature is logged continuously throughout, and for
-  the geothermal condition the coolant inlet temperature is logged too
-  (both optional DS18B20 sensors -- if you don't have an ambient sensor
-  wired up, delta-T fitting falls back to absolute temperature, see
-  thermal_system_id.py).
+- Ambient room temperature is logged continuously throughout (optional
+  DS18B20 sensor -- if you don't have one wired up, delta-T fitting
+  falls back to absolute temperature, see thermal_system_id.py).
 - Fits are done on delta_T = T_die - T_ambient, not absolute temperature,
   so ambient drift across trials doesn't bleed into the R_th estimate.
 - The no_cooling and fan conditions likely reduce to a single-node RC
@@ -45,7 +43,6 @@ Usage
   python3 step_load_test.py --model tinyllama.gguf --condition geothermal \
       --trial 1 --output ./trial_data \
       --ambient-sensor 28-0000ambient1 \
-      --t-in-sensor 28-0000abcd1111 --t-out-sensor 28-0000abcd2222 \
       --pump-duty 100 --lock-clock
 
   # Dry run without hardware (useful for testing the state machine/fit
@@ -76,6 +73,48 @@ CHANGE LOG (this file)
   `vcgencmd pmic_read_adc` actually refreshes on your hardware (see the
   latency/staleness check described alongside PowerSampler in
   geo_common.py).
+- Load generation during step_up no longer measures or reports tokens/sec
+  or time-to-first-token. This script only needs the CPU to be genuinely
+  busy running real forward passes for a known, controlled amount of
+  wall-clock time each iteration -- it was never using generation speed
+  for anything thermal. Trying to measure that speed was also the source
+  of a long chain of false positives ("implausible tokens/sec"): KV-cache
+  fast-returns, early end-of-sequence on very short completions, and
+  timing artifacts all produced the same symptom but needed different
+  fixes, and none of it was actually necessary. run_inference_burst()
+  replaces run_inference_once(): it drives the model in a loop of small
+  generations, resetting between each, until a fixed duration has elapsed
+  -- matching --poll-interval, the same cadence idle phases already use --
+  which also fixes step_up logging far fewer rows than idle did, since
+  iteration length is no longer at the mercy of however long any one
+  generation happened to take.
+- Removed the coolant inlet/outlet sensors (--t-in-sensor/--t-out-sensor)
+  and the fluid-side heat_removed_w / flow_rate_lph computation. Q is now
+  q_cpu_w, taken directly from measured CPU/SoC electrical power via
+  geo_common.compute_q_cpu_w() -- see that function's docstring for why.
+  Ambient temperature logging and delta-T fitting are unaffected; only
+  the coolant-loop-specific measurement is gone. This also simplifies
+  the fit input to thermal_system_id.py: --power-col now defaults to
+  q_cpu_w instead of the old combined power_w (Pi + pump), since Q for
+  the die should be the CPU's own draw, not the pump's. Pump power is
+  still computed (geothermal condition only, per the earlier phantom-
+  power fix) and still feeds COP/PUE -- it's just no longer part of Q.
+- Added a hard --min-hold-s floor to the phase state machine
+  (_advance_phase). A phase can no longer be ended by the stability
+  check alone until at least --min-hold-s has elapsed, regardless of
+  what the SlopeTracker's trailing --stabilize-window says. This exists
+  because the slope check only looks at the trailing window seconds --
+  for a slow branch (large tau2, as seen on the geothermal condition),
+  that window can look flat well before the temperature has actually
+  finished moving, since a slow exponential's rate of change keeps
+  shrinking throughout its tail. Without this floor, a phase can end
+  with the slow branch barely captured (observed directly on a geothermal
+  step_down phase that ended at ~140s and left thermal_system_id.py's
+  two-exponential fit unable to resolve tau2 -- a near-degenerate
+  tau1≈tau2 result instead). Default is 0 (off), so existing behavior and
+  invocations are unaffected unless you opt in. --max-idle-wait /
+  --max-hold-wait remain hard ceilings on top of this regardless, so a
+  bad sensor or drafty room still can't hang the trial forever.
 """
 
 import argparse
@@ -110,11 +149,8 @@ PHASES = ["idle_pre", "step_up", "step_down", "idle_post"]
 CSV_HEADERS = [
     "timestamp", "time_s", "phase", "load_state", "cooling_type", "trial",
     "cpu_temp_c", "ambient_c", "delta_t_die_ambient_c",
-    "t_in_c", "t_out_c",
     "cpu_clock_mhz", "throttled",
-    "pump_duty_pct", "flow_rate_lph", "heat_removed_w",
-    "pump_power_w", "pi_power_w", "power_w", "cop", "pue",
-    "tokens_per_sec", "time_to_first_token_sec",
+    "pump_duty_pct", "pump_power_w", "pi_power_w", "q_cpu_w", "power_w", "cop", "pue",
     "stabilization_slope_c_per_min",
 ]
 
@@ -161,57 +197,42 @@ class SlopeTracker:
         return bool(abs(slope) < threshold_c_per_min), slope
 
 
-def run_inference_once(llm, prompt, max_tokens):
-    """One inference call. Returns (tokens_generated, tok/s, ttft_sec).
-    Mirrors benchmark.py's run_inference so tokens/sec numbers from both
-    scripts are comparable.
-
-    IMPORTANT: llm.reset() is called before every call. Without it, the
-    KV cache/context from the previous call is still sitting in the
-    Llama object, and because STRESS_PROMPT is byte-identical on every
-    iteration, llama.cpp's prefix-caching matches the new prompt against
-    the old (prompt + previously generated) context and reuses almost
-    all of it -- and once the accumulated context creeps past n_ctx
-    (512 here: ~stress prompt + max_tokens is already close to that
-    after a single call), llama-cpp-python's automatic context-shift
-    kicks in on every subsequent call. Net effect: after the first call,
-    every call "generates" ~max_tokens in under a millisecond, which is
-    physically impossible on this hardware and means the CPU stops
-    actually being loaded for the rest of step_up -- exactly what showed
-    up as pi_power_w barely rising above idle and a garbage tau fit
-    (near-infinite single-exp tau, degenerate two-exp fit) on the
-    thermal side. reset() clears n_past/the KV cache so every call does
-    a real, fresh forward pass over the prompt again.
+def run_inference_burst(llm, prompt, duration_s, max_tokens_per_call=64):
     """
-    llm.reset()
+    Drive the model for approximately duration_s seconds of real forward-
+    pass compute, purely to load the CPU for a known, controlled amount of
+    wall-clock time. Returns nothing -- tokens/sec and time-to-first-token
+    are deliberately not measured or reported anymore.
+
+    This replaces the earlier run_inference_once(), which tried to also
+    report generation speed and hit a long chain of false positives trying
+    to do so: KV-cache fast-returns, a small chat model hitting EOS after
+    1-2 tokens and producing a meaningless rate from near-zero elapsed
+    time, and general timing noise. All of that only mattered because the
+    rate was being measured at all -- nothing thermal actually depends on
+    it. Rather than chase down every way a generation-speed measurement
+    can go wrong, this sidesteps the whole category: no tokens are
+    counted, no rate is computed, so there is nothing for a "bug" to
+    corrupt. The only thing that matters is that llm() is genuinely
+    running forward passes on the CPU for close to duration_s seconds.
+
+    llm.reset() is called before each underlying call so every burst starts
+    from a clean KV cache/context rather than accumulating state -- this
+    just keeps behavior predictable, not because a rate needs protecting.
+    Generation runs in a loop of small max_tokens_per_call chunks (rather
+    than one long call) so elapsed time can be checked frequently and the
+    burst stops close to duration_s regardless of how any individual
+    completion happens to behave (including stopping early on EOS, which
+    just triggers an immediate fresh reset()+restart within the same
+    burst).
+    """
     start = time.time()
-    first_token_time = None
-    tokens_generated = 0
-    for _chunk in llm(prompt, max_tokens=max_tokens, temperature=0.7, echo=False, stream=True):
-        if first_token_time is None:
-            first_token_time = time.time()
-        tokens_generated += 1
-    end = time.time()
-    ttft = (first_token_time - start) if first_token_time else None
-    generation_time = (end - first_token_time) if first_token_time else (end - start)
-    tps = (tokens_generated / generation_time) if generation_time > 0 else None
-
-    # Sanity guard: a Pi 5 CPU cannot do meaningful forward passes fast
-    # enough to hit these numbers. If it happens anyway (e.g. a future
-    # llama-cpp-python version reintroduces a caching path we didn't
-    # anticipate), flag it loudly in the console and null out the
-    # sample's timing fields rather than silently logging a physically
-    # impossible number that will corrupt the thermal fit again.
-    MAX_PLAUSIBLE_TPS = 200.0  # generous upper bound for CPU inference on this hardware
-    if tps is not None and tps > MAX_PLAUSIBLE_TPS:
-        print(f"\n  WARNING: implausible tokens/sec ({tps:.0f}) -- likely a KV-cache/"
-              f"context bug, not real inference. Discarding this sample's timing "
-              f"(load-phase CPU stress will still have happened via the forward pass "
-              f"up to the anomaly, but don't trust tokens_per_sec/ttft here).")
-        tps = None
-        ttft = None
-
-    return tokens_generated, tps, ttft
+    while time.time() - start < duration_s:
+        llm.reset()
+        for _chunk in llm(prompt, max_tokens=max_tokens_per_call, temperature=0.7,
+                            echo=False, stream=True):
+            if time.time() - start >= duration_s:
+                break
 
 
 def busy_stress(seconds=1.0):
@@ -238,10 +259,13 @@ def run_trial(args):
     print(f"{'='*72}")
     print(f"  Stabilization   : |slope| < {args.stabilize_slope} C/min over "
           f"{args.stabilize_window:.0f}s window")
+    print(f"  Min hold        : {args.min_hold_s:.0f}s on step_up/step_down only "
+          f"(idle phases unaffected)")
     print(f"  Max idle wait   : {args.max_idle_wait/60:.0f} min")
     print(f"  Max hold wait   : {args.max_hold_wait/60:.0f} min")
     print(f"  Pump duty       : {args.pump_duty}%")
     print(f"  Power sampling  : every {args.power_sample_interval*1000:.0f} ms (background thread)")
+    print(f"  Q source        : CPU electrical power (q_cpu_w)")
     print(f"  Output CSV      : {csv_path}")
     if args.run_order_note:
         print(f"  Run-order note  : {args.run_order_note}")
@@ -258,6 +282,11 @@ def run_trial(args):
     if not args.simulate and LLAMA_AVAILABLE and args.model and os.path.exists(args.model):
         print("Loading model... (this may take 30-60 seconds on Pi 5)")
         llm = Llama(model_path=args.model, n_ctx=512, n_threads=4, verbose=False)
+        # Explicitly disable any internal LlamaCache. Some llama-cpp-python
+        # versions keep one active by default even if you never call
+        # set_cache() yourself, and it can short-circuit repeated identical
+        # prompts independently of reset()/n_past.
+        llm.set_cache(None)
         print("Model loaded.\n")
     elif not args.simulate:
         print("No usable model found, load phase will use CPU stress instead of real inference.\n")
@@ -296,10 +325,9 @@ def run_trial(args):
                 clock = gc.get_cpu_clock()
                 throttle = gc.get_throttle_status()
                 ambient = gc.read_ds18b20(args.ambient_sensor) if args.ambient_sensor else None
-                t_in, t_out = gc.get_water_temps(args.t_in_sensor, args.t_out_sensor)
 
                 if args.simulate:
-                    temp, ambient, t_in, t_out, clock = _simulate_readings(
+                    temp, ambient, clock = _simulate_readings(
                         t, phase, args.condition, step_up_time, step_down_time
                     )
                     throttle = {"throttled": False, "freq_capped": False, "soft_temp_limit": False}
@@ -312,9 +340,17 @@ def run_trial(args):
 
                 delta_t_die_ambient = (temp - ambient) if (temp is not None and ambient is not None) else None
 
-                flow_rate = gc.duty_to_flow_rate_lph(args.pump_duty)
-                heat_removed = gc.compute_heat_removed_w(flow_rate, t_in, t_out)
-                pump_power = gc.compute_pump_power_w(current_a=args.pump_current)
+                # Only the geothermal condition actually has a pump doing
+                # work on a coolant loop. compute_pump_power_w() falls back
+                # to a fixed nominal current estimate (~0.75W) whenever
+                # --pump-current isn't measured, and that constant was being
+                # added into total_power for every condition -- for
+                # fan/no_cooling trials that's phantom electrical draw with
+                # no real pump behind it, and it inflated PUE for conditions
+                # that shouldn't have any pump overhead. This has no effect
+                # on Q anymore (Q is q_cpu_w, not total_power), but it still
+                # matters for COP/PUE, so it stays.
+                pump_power = gc.compute_pump_power_w(current_a=args.pump_current) if args.condition == "geothermal" else 0.0
                 if args.simulate:
                     pi_power = (8.0 if phase == "step_up" else 3.0) + np.random.normal(0, 0.1)
                 else:
@@ -325,16 +361,20 @@ def run_trial(args):
                     if pi_power is None:
                         pi_power = sampler.latest()
                     last_power_ts = now_ts
-                cop = gc.compute_cop(heat_removed, pump_power)
+                q_cpu = gc.compute_q_cpu_w(pi_power)
+                cop = gc.compute_cop(q_cpu, pump_power)
                 pue = gc.compute_pue(pi_power, pump_power)
                 total_power = (pi_power or 0) + (pump_power or 0) if pi_power is not None else None
 
                 load_state = "load" if phase == "step_up" else "idle"
 
-                tokens_generated = tps = ttft = None
                 if phase == "step_up":
                     if llm is not None:
-                        tokens_generated, tps, ttft = run_inference_once(llm, STRESS_PROMPT, args.max_tokens)
+                        # Bounded to --poll-interval, same cadence idle uses --
+                        # keeps step_up logging just as densely as idle instead
+                        # of however long a generation happened to take.
+                        run_inference_burst(llm, STRESS_PROMPT, args.poll_interval,
+                                            max_tokens_per_call=args.max_tokens)
                     elif not args.simulate:
                         busy_stress(seconds=min(2.0, args.poll_interval))
                     else:
@@ -358,20 +398,15 @@ def run_trial(args):
                     "cpu_temp_c": temp,
                     "ambient_c": ambient,
                     "delta_t_die_ambient_c": round(delta_t_die_ambient, 3) if delta_t_die_ambient is not None else "",
-                    "t_in_c": round(t_in, 2) if t_in is not None else "",
-                    "t_out_c": round(t_out, 2) if t_out is not None else "",
                     "cpu_clock_mhz": clock,
                     "throttled": int(throttle["throttled"]),
                     "pump_duty_pct": args.pump_duty,
-                    "flow_rate_lph": round(flow_rate, 2) if flow_rate is not None else "",
-                    "heat_removed_w": heat_removed if heat_removed is not None else "",
                     "pump_power_w": pump_power if pump_power is not None else "",
                     "pi_power_w": round(pi_power, 3) if pi_power is not None else "",
+                    "q_cpu_w": round(q_cpu, 3) if q_cpu is not None else "",
                     "power_w": round(total_power, 2) if total_power is not None else "",
                     "cop": cop if cop is not None else "",
                     "pue": pue if pue is not None else "",
-                    "tokens_per_sec": round(tps, 2) if tps is not None else "",
-                    "time_to_first_token_sec": round(ttft, 3) if ttft is not None else "",
                     "stabilization_slope_c_per_min": round(slope, 4) if slope is not None else "",
                 }
                 writer.writerow(row)
@@ -385,15 +420,13 @@ def run_trial(args):
                     "trial": args.trial,
                     "cpu_temp_c": temp,
                     "ambient_c": ambient,
-                    "t_in_c": t_in,
-                    "t_out_c": t_out,
+                    "q_cpu_w": q_cpu,
                     "stabilization_slope_c_per_min": slope,
                     "stable": stable,
-                    "tokens_per_sec": tps,
                     "pue": pue,
                 })
 
-                _print_status(t, phase, temp, ambient, t_in, slope, stable, args.stabilize_slope)
+                _print_status(t, phase, temp, ambient, q_cpu, slope, stable, args.stabilize_slope)
 
                 phase_elapsed = t - phase_start_t
                 phase = _advance_phase(
@@ -438,17 +471,39 @@ def _advance_phase(phase, stable, phase_elapsed, args):
     """State machine transitions. Each idle phase waits for stabilization
     (or a max-wait timeout, so a bad sensor or a drafty room can't hang
     the trial forever); step_up runs continuously until stabilization or
-    its own timeout."""
+    its own timeout.
+
+    min_hold_s is a hard floor, but only on step_up and step_down: those
+    are the phases that get fit for tau1/tau2 in thermal_system_id.py, so
+    those are the ones that need to run long enough for the slow branch
+    to show itself before "stable" is allowed to end them (the slope
+    check only looks at the trailing --stabilize-window seconds, which
+    can look flat well before a slow exponential tail has actually
+    finished decaying -- see the CHANGE LOG entry above). idle_pre and
+    idle_post don't get fit the same way and never showed this
+    truncation problem, so they keep the original stable-or-timeout
+    behavior unconditionally -- otherwise a --min-hold-s tuned for
+    step_down's slow tail (e.g. 1000s) would also force every idle phase
+    to sit for 1000s before it's allowed to start, even once it's
+    genuinely at rest.
+
+    The max-wait ceiling still applies unconditionally on top of
+    min_hold_s wherever it's used, so a bad sensor or drafty room still
+    can't hang the trial forever even if min_hold_s is set larger than
+    intended.
+    """
     if phase == "idle_pre":
         if stable or phase_elapsed >= args.max_idle_wait:
             return "step_up"
         return "idle_pre"
     if phase == "step_up":
-        if stable or phase_elapsed >= args.max_hold_wait:
+        timed_out = phase_elapsed >= args.max_hold_wait
+        if timed_out or (phase_elapsed >= args.min_hold_s and stable):
             return "step_down"
         return "step_up"
     if phase == "step_down":
-        if stable or phase_elapsed >= args.max_idle_wait:
+        timed_out = phase_elapsed >= args.max_idle_wait
+        if timed_out or (phase_elapsed >= args.min_hold_s and stable):
             return "idle_post"
         return "step_down"
     if phase == "idle_post":
@@ -458,14 +513,14 @@ def _advance_phase(phase, stable, phase_elapsed, args):
     return "done"
 
 
-def _print_status(t, phase, temp, ambient, t_in, slope, stable, threshold):
+def _print_status(t, phase, temp, ambient, q_cpu, slope, stable, threshold):
     temp_str = f"{temp:.2f}C" if temp is not None else "n/a"
     amb_str = f"{ambient:.2f}C" if ambient is not None else "n/a"
-    tin_str = f"{t_in:.2f}C" if t_in is not None else "n/a"
+    q_str = f"{q_cpu:.2f}W" if q_cpu is not None else "n/a"
     slope_str = f"{slope:+.3f} C/min" if slope is not None else "warming up window..."
     stable_str = "STABLE" if stable else "..."
     print(
-        f"\r[{t:>6.0f}s] {phase:<10} | CPU {temp_str:<8} amb {amb_str:<8} Tin {tin_str:<8} "
+        f"\r[{t:>6.0f}s] {phase:<10} | CPU {temp_str:<8} amb {amb_str:<8} Q_cpu {q_str:<9} "
         f"| slope {slope_str:<16} (thresh {threshold}) | {stable_str}",
         end="", flush=True
     )
@@ -502,10 +557,8 @@ def _simulate_readings(t, phase, condition, step_up_time, step_down_time):
                 temp = baseline + dT_load * np.exp(-since_down / tau)
 
     temp += np.random.normal(0, 0.15)
-    t_in = ambient + 1.0 + np.random.normal(0, 0.1) if condition == "geothermal" else None
-    t_out = t_in + 3.0 if t_in is not None else None
     clock = 2400
-    return temp, ambient, t_in, t_out, clock
+    return temp, ambient, clock
 
 
 def _fit_and_report(csv_path, args, step_up_time, step_down_time):
@@ -530,7 +583,7 @@ def _fit_and_report(csv_path, args, step_up_time, step_down_time):
 
     results_df, results_csv, md_path, bench_plot = tsid.run_thermal_sysid(
         df, outdir,
-        time_col="time_s", temp_col="cpu_temp_c", power_col="power_w",
+        time_col="time_s", temp_col="cpu_temp_c", power_col="q_cpu_w",
         load_col="load_state", cooling_col="cooling_type",
         ambient_col=ambient_col,
         window_s=args.fit_window,
@@ -592,20 +645,37 @@ def main():
 
     ap.add_argument("--ambient-sensor", type=str, default="",
                      help="DS18B20 device ID for ambient room temperature")
-    ap.add_argument("--t-in-sensor", type=str, default="",
-                     help="DS18B20 device ID for coolant inlet temp (geothermal condition)")
-    ap.add_argument("--t-out-sensor", type=str, default="",
-                     help="DS18B20 device ID for coolant outlet temp (geothermal condition)")
 
     ap.add_argument("--pump-duty", type=int, default=100)
     ap.add_argument("--pump-current", type=float, default=None)
     ap.add_argument("--lock-clock", action="store_true")
-    ap.add_argument("--max-tokens", type=int, default=150)
+    ap.add_argument("--max-tokens", type=int, default=64,
+                     help="Max tokens per underlying generation call inside a load burst "
+                          "(default: 64). This is a chunk size, not a target -- "
+                          "run_inference_burst() strings calls together until "
+                          "--poll-interval of wall-clock time has elapsed, regardless of "
+                          "how many chunks that takes.")
 
     ap.add_argument("--stabilize-slope", type=float, default=0.05,
                      help="Stabilization threshold in C/min (default: 0.05, per test plan)")
     ap.add_argument("--stabilize-window", type=float, default=120.0,
                      help="Rolling window in seconds over which the slope is estimated (default: 120)")
+    ap.add_argument("--min-hold-s", type=float, default=0.0,
+                     help="Hard floor in seconds applied to step_up and step_down only "
+                          "(idle_pre/idle_post are unaffected): those two phases cannot be "
+                          "ended by the stability check until at least this much time has "
+                          "elapsed, even if the SlopeTracker says it's stable sooner (default: "
+                          "0, i.e. no floor -- the original behavior). The --stabilize-window "
+                          "slope check can look flat well before a slow branch (large tau2) "
+                          "has actually finished moving, since a slow exponential's rate of "
+                          "change keeps shrinking throughout its tail -- this was observed on "
+                          "a geothermal step_down phase that ended at ~140s and left "
+                          "thermal_system_id.py's two-exponential fit unable to resolve tau2 "
+                          "(near-degenerate tau1≈tau2 result instead). Set this to roughly "
+                          "3-5x your expected tau2 (e.g. 800-1300s if you expect tau2 around "
+                          "250-300s) so the slow branch has time to show itself before "
+                          "stability can end step_up/step_down. --max-idle-wait / "
+                          "--max-hold-wait remain hard ceilings on top of this regardless.")
     ap.add_argument("--max-idle-wait", type=float, default=1800.0,
                      help="Max seconds to wait for an idle phase to stabilize before forcing "
                           "the transition anyway (default: 1800 = 30 min)")
@@ -620,10 +690,10 @@ def main():
                           "up to 10 min per transition -- increase for a slow geothermal tail)")
     ap.add_argument("--power-sample-interval", type=float, default=0.02,
                      help="Seconds between background power samples (default: 0.02 = 50Hz). "
-                          "Each logged row's pi_power_w is the time-weighted average of these "
-                          "samples over the interval since the previous row, not a single "
-                          "instantaneous read. Lower this only as far as your hardware's real "
-                          "refresh rate supports -- check whether consecutive `vcgencmd "
+                          "Each logged row's pi_power_w / q_cpu_w is the time-weighted average "
+                          "of these samples over the interval since the previous row, not a "
+                          "single instantaneous read. Lower this only as far as your hardware's "
+                          "real refresh rate supports -- check whether consecutive `vcgencmd "
                           "pmic_read_adc` calls actually return distinct values at the rate "
                           "you're asking for before trusting a very small interval.")
 
@@ -633,12 +703,13 @@ def main():
 
     args = ap.parse_args()
 
-    if args.condition == "geothermal" and not args.simulate and (not args.t_in_sensor or not args.t_out_sensor):
-        print("Warning: geothermal condition without --t-in-sensor/--t-out-sensor -- "
-              "coolant loop temps will be logged blank. Run with no sensor args first to "
-              "list detected 1-wire IDs:")
-        found = gc.list_available_temp_sensors()
-        print(f"  Detected: {found if found else '(none found)'}")
+    if args.min_hold_s >= args.max_idle_wait or args.min_hold_s >= args.max_hold_wait:
+        print(f"Warning: --min-hold-s ({args.min_hold_s:.0f}s) is >= --max-idle-wait "
+              f"({args.max_idle_wait:.0f}s) and/or --max-hold-wait ({args.max_hold_wait:.0f}s). "
+              f"The stability check will never be able to end a phase early -- every phase "
+              f"will just run until its max-wait timeout. That may be exactly what you want "
+              f"for a deliberately long, fixed-duration hold, but if not, raise --max-idle-wait "
+              f"/ --max-hold-wait above --min-hold-s.")
 
     run_trial(args)
 

@@ -35,11 +35,13 @@ tau_fit_summary.csv -- this script doesn't re-fit anything, only
 simulates forward with those fixed parameters.
 
 Q(t), the "how much heat is being generated right now" signal, is taken
-from the rig's own measured power_w column when available (Pi power +
-pump power), falling back to fixed --load-power-w / --idle-power-w
-nominal values if power telemetry isn't available (e.g. off-Pi testing).
-This has to be the same convention thermal_system_id.py used for Q_ss
-when it derived R_th, or the predicted delta_T will be scaled wrong.
+from the rig's own measured CPU/SoC electrical power (q_cpu_w) when
+available, falling back to fixed --load-power-w / --idle-power-w nominal
+values if power telemetry isn't available (e.g. off-Pi testing). This has
+to be the same convention thermal_system_id.py used for Q_ss when it
+derived R_th, or the predicted delta_T will be scaled wrong -- which is
+why this defaults to q_cpu_w, matching thermal_system_id.py's default
+--power-col.
 
 Usage
 -----
@@ -47,7 +49,6 @@ Usage
         --trial 1 --output ./trial_data \
         --tau-source ./trial_data/fit_geothermal_trial1/tau_fit_summary.csv \
         --ambient-sensor 28-0000ambient1 \
-        --t-in-sensor 28-0000abcd1111 --t-out-sensor 28-0000abcd2222 \
         --pump-duty 100 --lock-clock --total-minutes 25
 
     # Dry run without hardware:
@@ -58,18 +59,6 @@ Same MAX_SAFE_TEMP_C safety stop as the other two scripts applies.
 
 CHANGE LOG (this file)
 -----------------------
-- run_inference_once() now calls llm.reset() before every generation
-  call, matching step_load_test.py. Without it, llama.cpp's prefix cache
-  matches the byte-identical STRESS_PROMPT against leftover KV-cache/
-  context from the previous call, the accumulated context creeps past
-  n_ctx, and every call after the first "generates" ~max_tokens in under
-  a millisecond -- i.e. the CPU stops actually being loaded for the rest
-  of the trial's load phases, which showed up as pi_power_w barely
-  rising above idle and a predicted delta_T trace that stayed flat near
-  the calibration's steady-state value regardless of the load/idle
-  cycle. Also added the same implausible-tokens/sec guard
-  step_load_test.py has, so a regression here is caught loudly instead
-  of silently corrupting the comparison again.
 - pi_power is now read via geo_common.PowerSampler (background thread,
   time-weighted average over the interval since the last row) instead of
   a single instantaneous get_pi_power_w() snapshot per loop iteration,
@@ -77,6 +66,34 @@ CHANGE LOG (this file)
   ~1s-cadence sample under-resolves real power fluctuations relative to
   the die's fast (~6s) time constant, which matters even more here since
   Q(t) is being fed straight into RCPredictor.step() every iteration.
+- RCPredictor now supports seed(delta_T0), called once from the first
+  row's real measured delta_T instead of assuming the rig starts at
+  delta_T=0. Without this, the whole predicted curve tended to sit below
+  measured by a near-constant offset for the length of a short trial,
+  since the slow branch doesn't forget a wrong t=0 state quickly.
+- Load generation during "load" phases no longer measures or reports
+  tokens/sec. This script only needs the CPU to be genuinely busy running
+  real forward passes for a known, controlled amount of wall-clock time
+  each iteration -- nothing thermal depends on generation speed. Trying
+  to measure it was the source of repeated false positives ("implausible
+  tokens/sec"): KV-cache fast-returns, a small chat model hitting EOS
+  after 1-2 tokens and producing a meaningless rate from near-zero
+  elapsed time, and general timing noise all looked identical but needed
+  different fixes. run_inference_burst() replaces run_inference_once(): it
+  strings small generations together, resetting between each, until a
+  fixed duration (--poll-interval, matching idle's cadence) has elapsed,
+  regardless of how any individual completion behaves. This also fixes
+  "load" rows being logged far less densely than "idle" rows, since
+  iteration length is no longer at the mercy of however long a generation
+  happened to take.
+- Removed the coolant inlet/outlet sensors (--t-in-sensor/--t-out-sensor)
+  and the fluid-side heat_removed_w / flow_rate_lph fields. Q(t) fed into
+  the RC predictor (and used for COP) is now q_cpu_w, CPU/SoC electrical
+  power, matching the q_cpu_w-based calibration thermal_system_id.py now
+  produces by default. Ambient temperature logging is unaffected. Pump
+  power is still computed (geothermal condition only, per the earlier
+  phantom-power fix) and still feeds COP/PUE -- it's just no longer part
+  of Q.
 """
 
 import argparse
@@ -105,11 +122,9 @@ STRESS_PROMPT = (
 
 CSV_HEADERS = [
     "timestamp", "time_s", "cycle_num", "phase", "load_state", "cooling_type", "trial",
-    "cpu_temp_c", "ambient_c", "delta_t_die_ambient_c",
-    "t_in_c", "t_out_c", "cpu_clock_mhz", "throttled",
-    "pump_duty_pct", "flow_rate_lph", "heat_removed_w",
-    "pump_power_w", "pi_power_w", "power_w", "cop", "pue",
-    "tokens_per_sec", "predicted_delta_t_c",
+    "cpu_temp_c", "ambient_c", "delta_t_die_ambient_c", "cpu_clock_mhz", "throttled",
+    "pump_duty_pct", "pump_power_w", "pi_power_w", "q_cpu_w", "power_w", "cop", "pue",
+    "predicted_delta_t_c",
 ]
 
 
@@ -163,7 +178,7 @@ def load_calibration(tau_csv_path, condition, row_index=0):
             if col not in row or pd.isna(row[col]):
                 raise ValueError(
                     f"Calibration row is a two-exponential fit but is missing '{col}'. "
-                    f"Was power_w logged during the step test? R1/R2 can't be derived "
+                    f"Was q_cpu_w logged during the step test? R1/R2 can't be derived "
                     f"without it -- rerun step_load_test.py with real (or --simulate) "
                     f"power logging."
                 )
@@ -198,7 +213,7 @@ def load_calibration(tau_csv_path, condition, row_index=0):
             if col not in row or pd.isna(row[col]):
                 raise ValueError(
                     f"Calibration row is a single-exponential fit but is missing '{col}'. "
-                    f"Was power_w logged during the step test?"
+                    f"Was q_cpu_w logged during the step test?"
                 )
         calib.update({
             "tau": float(row["tau_nonlinear_s"]),
@@ -226,6 +241,41 @@ class RCPredictor:
             self.x2 = 0.0
         else:
             self.x = 0.0
+
+    def seed(self, delta_T0):
+        """
+        Initialize predictor state from a known starting delta_T (e.g. the
+        rig's actual measured delta_T on the trial's first row), instead of
+        assuming the model starts at equilibrium with zero power (delta_T=0).
+
+        Without this, the predictor always starts from "die exactly at
+        ambient," but the rig is rarely actually there at t=0 -- residual
+        heat from whatever happened just before the bursty trial started
+        typically leaves delta_T already elevated by several degrees. Since
+        the slow branch's tau (tens of seconds for this fan calibration)
+        doesn't fully decay away within a short trial, an unseeded predictor
+        spends a large fraction of the run still "remembering" the wrong
+        starting point -- which shows up as the whole predicted curve
+        sitting below measured by a near-constant offset, even when the
+        dynamics and amplitude are otherwise correct.
+
+        For the two-exponential model, the seed is split across the two
+        branches proportional to their steady-state resistances (R1:R2),
+        which is a reasonable approximation of how a system that had been
+        running under some prior load would actually be distributed between
+        the fast and slow thermal masses.
+        """
+        if self.model == "two_exponential":
+            R1, R2 = self.calib["R1"], self.calib["R2"]
+            total_R = R1 + R2
+            if total_R > 0:
+                self.x1 = delta_T0 * (R1 / total_R)
+                self.x2 = delta_T0 * (R2 / total_R)
+            else:
+                self.x1 = delta_T0 / 2.0
+                self.x2 = delta_T0 / 2.0
+        else:
+            self.x = delta_T0
 
     def step(self, dt_s, Q_w):
         """Advance the model by dt_s seconds under constant power Q_w.
@@ -255,52 +305,40 @@ class RCPredictor:
 # Inference / stress helpers (shared pattern with the other two scripts)
 # ---------------------------------------------------------------------------
 
-def run_inference_once(llm, prompt, max_tokens):
-    """One inference call. Returns (tokens_generated, tok/s).
-
-    IMPORTANT: llm.reset() is called before every call. Without it, the
-    KV cache/context from the previous call is still sitting in the
-    Llama object, and because STRESS_PROMPT is byte-identical on every
-    iteration, llama.cpp's prefix-caching matches the new prompt against
-    the old (prompt + previously generated) context and reuses almost
-    all of it -- and once the accumulated context creeps past n_ctx
-    (512 here), llama-cpp-python's automatic context-shift kicks in on
-    every subsequent call. Net effect without reset(): after the first
-    call, every call "generates" ~max_tokens in under a millisecond,
-    which is physically impossible on this hardware and means the CPU
-    stops actually being loaded for the rest of the load phases -- this
-    showed up directly as pi_power_w barely rising above idle during
-    "load" and a predicted delta_T trace that stayed flat near the
-    calibration's steady-state value regardless of the load/idle cycle,
-    since the RC model was being driven by an almost-constant Q(t).
-    reset() clears n_past/the KV cache so every call does a real, fresh
-    forward pass over the prompt again, matching step_load_test.py.
+def run_inference_burst(llm, prompt, duration_s, max_tokens_per_call=64):
     """
-    llm.reset()
+    Drive the model for approximately duration_s seconds of real forward-
+    pass compute, purely to load the CPU for a known, controlled amount of
+    wall-clock time. Returns nothing -- tokens/sec is deliberately not
+    measured or reported anymore.
+
+    This replaces the earlier run_inference_once(), which tried to also
+    report generation speed and hit a long chain of false positives doing
+    so: KV-cache fast-returns, a small chat model hitting EOS after 1-2
+    tokens and producing a meaningless rate from near-zero elapsed time,
+    and general timing noise. None of that mattered for the RC predictor
+    -- it only ever consumed Q(t) (from PowerSampler), never a token rate.
+    Rather than keep chasing every way a generation-speed measurement can
+    go wrong, this sidesteps the whole category: no tokens are counted, no
+    rate is computed, so there's nothing for a "bug" to corrupt. The only
+    thing that matters is that llm() is genuinely running forward passes
+    on the CPU for close to duration_s seconds.
+
+    llm.reset() is called before each underlying call so every burst starts
+    from a clean KV cache/context rather than accumulating state. Generation
+    runs in a loop of small max_tokens_per_call chunks so elapsed time can
+    be checked frequently and the burst stops close to duration_s regardless
+    of how any individual completion behaves (including stopping early on
+    EOS, which just triggers an immediate fresh reset()+restart within the
+    same burst).
+    """
     start = time.time()
-    first_token_time = None
-    tokens_generated = 0
-    for _chunk in llm(prompt, max_tokens=max_tokens, temperature=0.7, echo=False, stream=True):
-        if first_token_time is None:
-            first_token_time = time.time()
-        tokens_generated += 1
-    end = time.time()
-    generation_time = (end - first_token_time) if first_token_time else (end - start)
-    tps = (tokens_generated / generation_time) if generation_time > 0 else None
-
-    # Same sanity guard as step_load_test.py: a Pi 5 CPU cannot do
-    # meaningful forward passes fast enough to hit these numbers. If it
-    # happens anyway, flag it loudly and null the timing rather than
-    # silently logging a physically impossible number that will corrupt
-    # both the CSV and (more importantly here) the Q(t) driving the
-    # RC prediction.
-    MAX_PLAUSIBLE_TPS = 200.0
-    if tps is not None and tps > MAX_PLAUSIBLE_TPS:
-        print(f"\n  WARNING: implausible tokens/sec ({tps:.0f}) -- likely a KV-cache/"
-              f"context bug, not real inference. Discarding this sample's timing.")
-        tps = None
-
-    return tokens_generated, tps
+    while time.time() - start < duration_s:
+        llm.reset()
+        for _chunk in llm(prompt, max_tokens=max_tokens_per_call, temperature=0.7,
+                            echo=False, stream=True):
+            if time.time() - start >= duration_s:
+                break
 
 
 def busy_stress(seconds=1.0):
@@ -331,9 +369,7 @@ def _simulate_readings(t, load_state, condition, ambient0=22.0):
     temp = target + (prev - target) * np.exp(-elapsed / tau) + rng_noise
     _simulate_readings._last_temp = temp
     _simulate_readings._last_t = t
-    t_in = ambient + 1.0 + np.random.normal(0, 0.1) if condition == "geothermal" else None
-    t_out = t_in + 3.0 if t_in is not None else None
-    return temp, ambient, t_in, t_out, 2400
+    return temp, ambient, 2400
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +402,7 @@ def run_trial(args):
     else:
         print(f"    tau={calib['tau']:.1f}s  R_th={calib['R_th']:.3f} C/W")
     print(f"  Power sampling  : every {args.power_sample_interval*1000:.0f} ms (background thread)")
+    print(f"  Q source        : CPU electrical power (q_cpu_w)")
     print(f"  Output CSV      : {csv_path}")
     print(f"{'='*72}\n")
 
@@ -380,6 +417,9 @@ def run_trial(args):
     if not args.simulate and LLAMA_AVAILABLE and args.model and os.path.exists(args.model):
         print("Loading model...")
         llm = Llama(model_path=args.model, n_ctx=512, n_threads=4, verbose=False)
+        # Explicitly disable any internal LlamaCache -- see run_inference_burst
+        # for why this matters even with reset() in place.
+        llm.set_cache(None)
         print("Model loaded.\n")
     elif not args.simulate:
         print("No usable model found, load phases will use CPU stress instead of real inference.\n")
@@ -400,6 +440,7 @@ def run_trial(args):
     t0 = time.time()
     last_t = 0.0
     last_power_ts = t0
+    predictor_seeded = False
     rows = []
 
     try:
@@ -423,10 +464,9 @@ def run_trial(args):
                     clock = gc.get_cpu_clock()
                     throttle = gc.get_throttle_status()
                     ambient = gc.read_ds18b20(args.ambient_sensor) if args.ambient_sensor else None
-                    t_in, t_out = gc.get_water_temps(args.t_in_sensor, args.t_out_sensor)
 
                     if args.simulate:
-                        temp, ambient, t_in, t_out, clock = _simulate_readings(t, load_state, args.condition)
+                        temp, ambient, clock = _simulate_readings(t, load_state, args.condition)
                         throttle = {"throttled": False, "freq_capped": False, "soft_temp_limit": False}
 
                     if temp is not None and temp >= gc.MAX_SAFE_TEMP_C:
@@ -434,9 +474,25 @@ def run_trial(args):
                               f"{gc.MAX_SAFE_TEMP_F}F limit at t={t:.0f}s. Ending trial early.")
                         break
 
-                    flow_rate = gc.duty_to_flow_rate_lph(args.pump_duty)
-                    heat_removed = gc.compute_heat_removed_w(flow_rate, t_in, t_out)
-                    pump_power = gc.compute_pump_power_w(current_a=args.pump_current)
+                    delta_t_die_ambient = (temp - ambient) if (temp is not None and ambient is not None) else None
+
+                    # Seed the predictor from the real starting delta_T the
+                    # first time it's available, instead of letting it start
+                    # from an assumed delta_T=0. See RCPredictor.seed() --
+                    # without this, the whole predicted curve tends to sit
+                    # below measured by a near-constant offset for the length
+                    # of a short trial, since the slow branch doesn't forget
+                    # a wrong t=0 state quickly.
+                    if not predictor_seeded and delta_t_die_ambient is not None:
+                        predictor.seed(delta_t_die_ambient)
+                        predictor_seeded = True
+
+                    # Only geothermal actually has a pump doing work on a
+                    # coolant loop -- see step_load_test.py for why this must
+                    # not be treated as real electrical draw for fan/no_cooling
+                    # trials. This no longer affects Q(t) (Q is q_cpu_w, not
+                    # total power) but still matters for COP/PUE.
+                    pump_power = gc.compute_pump_power_w(current_a=args.pump_current) if args.condition == "geothermal" else 0.0
                     if args.simulate:
                         pi_power = None
                     else:
@@ -449,16 +505,20 @@ def run_trial(args):
                         if pi_power is None:
                             pi_power = sampler.latest()
                         last_power_ts = now_ts
-                    cop = gc.compute_cop(heat_removed, pump_power)
+                    q_cpu = gc.compute_q_cpu_w(pi_power)
+                    cop = gc.compute_cop(q_cpu, pump_power)
                     pue = gc.compute_pue(pi_power, pump_power)
                     total_power = (pi_power or 0) + (pump_power or 0) if pi_power is not None else None
 
-                    # Q(t) for the predictor: prefer measured total power;
-                    # otherwise fall back to nominal load/idle wattage so
-                    # the model can still be exercised without power
-                    # telemetry (e.g. off-Pi or non-Pi-5 boards).
-                    if total_power is not None:
-                        Q = total_power
+                    # Q(t) for the predictor: prefer measured CPU electrical
+                    # power; otherwise fall back to nominal load/idle wattage
+                    # so the model can still be exercised without power
+                    # telemetry (e.g. off-Pi or non-Pi-5 boards). This must
+                    # match the Q convention thermal_system_id.py used when
+                    # it fit R_th/tau (q_cpu_w by default), or the predicted
+                    # delta_T will be scaled wrong.
+                    if q_cpu is not None:
+                        Q = q_cpu
                     else:
                         Q = args.load_power_w if load_state == "load" else args.idle_power_w
 
@@ -466,18 +526,20 @@ def run_trial(args):
                     pred_delta_t = predictor.step(dt, Q)
                     last_t = t
 
-                    tokens_generated = tps = None
                     if load_state == "load":
                         if llm is not None:
-                            tokens_generated, tps = run_inference_once(llm, STRESS_PROMPT, args.max_tokens)
+                            # Bounded to --poll-interval, same cadence idle
+                            # uses -- keeps "load" logging just as densely as
+                            # "idle" instead of however long a generation
+                            # happened to take.
+                            run_inference_burst(llm, STRESS_PROMPT, args.poll_interval,
+                                                 max_tokens_per_call=args.max_tokens)
                         elif not args.simulate:
                             busy_stress(seconds=min(2.0, args.poll_interval))
                         else:
                             time.sleep(min(0.05, args.poll_interval))
                     else:
                         time.sleep(args.poll_interval)
-
-                    delta_t_die_ambient = (temp - ambient) if (temp is not None and ambient is not None) else None
 
                     row = {
                         "timestamp": datetime.now().isoformat(),
@@ -490,19 +552,15 @@ def run_trial(args):
                         "cpu_temp_c": temp,
                         "ambient_c": ambient,
                         "delta_t_die_ambient_c": round(delta_t_die_ambient, 3) if delta_t_die_ambient is not None else "",
-                        "t_in_c": round(t_in, 2) if t_in is not None else "",
-                        "t_out_c": round(t_out, 2) if t_out is not None else "",
                         "cpu_clock_mhz": clock,
                         "throttled": int(throttle["throttled"]),
                         "pump_duty_pct": args.pump_duty,
-                        "flow_rate_lph": round(flow_rate, 2) if flow_rate is not None else "",
-                        "heat_removed_w": heat_removed if heat_removed is not None else "",
                         "pump_power_w": pump_power if pump_power is not None else "",
                         "pi_power_w": round(pi_power, 3) if pi_power is not None else "",
+                        "q_cpu_w": round(q_cpu, 3) if q_cpu is not None else "",
                         "power_w": round(total_power, 2) if total_power is not None else "",
                         "cop": cop if cop is not None else "",
                         "pue": pue if pue is not None else "",
-                        "tokens_per_sec": round(tps, 2) if tps is not None else "",
                         "predicted_delta_t_c": round(pred_delta_t, 3),
                     }
                     writer.writerow(row)
@@ -649,20 +707,23 @@ def main():
                      help="Total trial duration (default 25, per the 20-30 min test plan)")
 
     ap.add_argument("--ambient-sensor", type=str, default="")
-    ap.add_argument("--t-in-sensor", type=str, default="")
-    ap.add_argument("--t-out-sensor", type=str, default="")
 
     ap.add_argument("--pump-duty", type=int, default=100)
     ap.add_argument("--pump-current", type=float, default=None)
     ap.add_argument("--lock-clock", action="store_true")
-    ap.add_argument("--max-tokens", type=int, default=150)
+    ap.add_argument("--max-tokens", type=int, default=64,
+                     help="Max tokens per underlying generation call inside a load burst "
+                          "(default: 64). This is a chunk size, not a target -- "
+                          "run_inference_burst() strings calls together until "
+                          "--poll-interval of wall-clock time has elapsed, regardless of "
+                          "how many chunks that takes.")
     ap.add_argument("--poll-interval", type=float, default=1.0)
     ap.add_argument("--power-sample-interval", type=float, default=0.02,
                      help="Seconds between background power samples (default: 0.02 = 50Hz). "
-                          "Each logged row's pi_power_w (and hence the Q(t) fed into the "
-                          "RC predictor) is the time-weighted average of these samples over "
-                          "the interval since the previous row, not a single instantaneous "
-                          "read. See geo_common.PowerSampler.")
+                          "Each logged row's pi_power_w / q_cpu_w (and hence the Q(t) fed "
+                          "into the RC predictor) is the time-weighted average of these "
+                          "samples over the interval since the previous row, not a single "
+                          "instantaneous read. See geo_common.PowerSampler.")
 
     ap.add_argument("--load-power-w", type=float, default=8.0,
                      help="Fallback Q(t) during load phases if power telemetry isn't "
@@ -674,10 +735,6 @@ def main():
                      help="Generate synthetic sensor readings instead of touching real hardware")
 
     args = ap.parse_args()
-
-    if args.condition == "geothermal" and not args.simulate and (not args.t_in_sensor or not args.t_out_sensor):
-        print("Warning: geothermal condition without --t-in-sensor/--t-out-sensor -- "
-              "coolant loop temps will be logged blank.")
 
     run_trial(args)
 

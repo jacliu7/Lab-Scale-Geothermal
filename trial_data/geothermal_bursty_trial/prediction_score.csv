@@ -1,0 +1,2 @@
+condition,trial,n_samples,rmse_c,mae_c,bias_c,correlation
+geothermal,6,411,1.2578140637542985,1.0266034063260343,-0.9018394160583943,0.9801487688447107

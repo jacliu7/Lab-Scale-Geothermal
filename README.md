@@ -1,15 +1,14 @@
-# Lab-Scale Geothermal Cooling for Edge AI Inference
+# Lab-Scale Geothermal Cooling
 
 Testing whether a small ground-loop cooling setup actually helps with the
 thermal load of a Raspberry Pi running local LLM inference, compared to no
-cooling and a plain fan. This repo is the test scripts, the shared hardware
-library, and the trial data behind the paper.
+cooling and a plain fan. This repo is the test scripts and the trial data behind the paper. You can read the paper here: (link goes here).
 
 Basic approach: step a Pi from idle to full inference load under each
 cooling condition, fit an RC thermal model to how the temperature responds
-(first-order, or two-exponential if one node doesn't fit it), then check
-that fitted model against a more realistic bursty on/off load. tau, R_th,
-C_th, COP, and PUE from these runs are what end up in the manuscript.
+(first-order or two-exponential), then check
+that fitted model against a more realistic bursty on/off load. tau, R<sub>th</sub>,
+C<sub>th</sub>, COP, and PUE from these runs are what end up in the manuscript.
 
 ## Layout
 
@@ -22,7 +21,7 @@ v3 tests/               current scripts, use these
 
 trial_data/              CSVs, fit summaries, plots from actual rig runs
 old testing files/       v0/v1/v2 iterations, kept around so old trial data still
-                         makes sense, not maintained -- don't run these
+                         makes sense, not maintained (don't run these)
 ```
 
 ## Setup
@@ -44,7 +43,7 @@ order across trials/days yourself, the scripts don't do that for you.
 ### Step load test (run this first)
 
 Idles until CPU temp is stable, steps the load to full inference, holds
-until stable again, steps back down. Fits tau/R_th/C_th on both
+until stable again, steps back down. Fits tau/R<sub>th</sub>/C<sub>th</sub> on both
 transitions as soon as it finishes.
 
 ```bash
@@ -102,8 +101,8 @@ logged interval, not grabbed once a second, because the die's thermal
 time constant (~6s) is fast enough that a single sample per iteration
 misses real fluctuations.
 
-Fits use delta_T = T_die - T_ambient whenever an ambient sensor is
-wired up so ambient drift between trials doesn't leak into R_th.
+Fits use &Delta;T = T<sub>die</sub> - T<sub>ambient</sub> whenever an ambient sensor is
+wired up so ambient drift between trials doesn't leak into R<sub>th</sub>.
 Without one it falls back to absolute temp.
 
 Set --min-hold-s on step_load_test.py for the geothermal condition,

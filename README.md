@@ -4,7 +4,7 @@ Testing whether a small ground-loop cooling setup actually helps with the
 thermal load of a Raspberry Pi running local LLM inference, compared to no
 cooling and a plain fan. This repo is the test scripts and the trial data behind the paper. 
 
-Paper link (manuscript in preparation for journal submission): 
+Paper link (manuscript in preparation for journal submission): [https://drive.google.com/file/d/1D_-WGECUQvrfjh6Mh2YQWhc46cdKZQDU/view?usp=sharing](url)
 Website for more information: [https://earthheat.org/products/geothermal_lab_demo.html#testing-demo](url)
 
 Basic approach: step a Pi from idle to full inference load under each

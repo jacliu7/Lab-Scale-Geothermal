@@ -31,8 +31,8 @@ old testing files/       v0/v1/v2 iterations, kept around so old trial data stil
 
 Python 3 with numpy, pandas, matplotlib, scipy. On the Pi you also want
 gpiozero for pump control and llama-cpp-python + a GGUF model for the real
-inference load. Neither's required just to run the scripts -- see
-`--simulate` below.
+inference load, but neither are required just to run the scripts (see
+`--simulate` below).
 
 ```bash
 pip install numpy pandas matplotlib scipy
@@ -57,7 +57,7 @@ python3 step_load_test.py --model tinyllama.gguf --condition geothermal \
     --pump-duty 100 --lock-clock
 ```
 
-Off-Pi dry run (no hardware, just to sanity check the state machine / fit
+Off-Pi --simulate dry run (no hardware, just to sanity check the state machine / fit
 pipeline):
 
 ```bash
